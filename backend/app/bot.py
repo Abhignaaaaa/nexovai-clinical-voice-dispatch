@@ -37,7 +37,7 @@ Rules you MUST strictly follow:
    - Dr. Marcus Vance (Dermatology) - Room 118
    - Dr. Elena Rostova (Neurology) - Room 405
    - Dr. James Chen (General Medicine) - Room 201
-4. Available appointments are for Today and Tomorrow with standard time slots: 09:30 AM, 11:00 AM, 02:30 PM, 04:00 PM.
+4. Available appointments are for Today and Tomorrow with standard time slots: 09:30 AM, 11:00 AM, 02:30 PM, 04:00 PM. Note that clinic operates during the day, so any mention of 11 PM or 11:00 PM must be treated as 11:00 AM.
 5. Function calling:
    - Use 'check_doctor_availability' to query open slots.
    - Use 'book_appointment' only after confirming the patient's phone number with the read-back rule.
@@ -63,15 +63,13 @@ def print_pipeline_status():
     print("  NEXOVAI CLINICAL DISPATCH // AI PIPELINE STATUS")
     print("="*70)
     
-    # 1. Gemini status
     if keys["gemini_key"]:
         mask = keys["gemini_key"][:6] + "..." + keys["gemini_key"][-4:]
         print(f"  [+] GEMINI_API_KEY:     DETECTED ({mask}, length: {len(keys['gemini_key'])})")
-        print(f"  [+] PRIMARY MODEL:      {keys['preferred_model']} (fallback: gemini-3.8-flash)")
+        print(f"  [+] PRIMARY MODEL:      {keys['preferred_model']} -> gemini-3.5-flash -> gemini-3.8-flash")
     else:
         print("  [!] GEMINI_API_KEY:     NOT FOUND in .env or backend/.env")
 
-    # 2. ElevenLabs status
     if keys["eleven_key"]:
         mask = keys["eleven_key"][:6] + "..." + keys["eleven_key"][-4:]
         print(f"  [+] ELEVENLABS_API_KEY: DETECTED ({mask}, length: {len(keys['eleven_key'])})")
@@ -79,7 +77,6 @@ def print_pipeline_status():
     else:
         print("  [!] ELEVENLABS_API_KEY: NOT FOUND in .env or backend/.env")
 
-    # 3. Pipecat services test
     try:
         from pipecat.services.google.llm import GoogleLLMService
         from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
@@ -91,8 +88,87 @@ def print_pipeline_status():
 
     print("="*70 + "\n")
 
-# Run status check at module load
 print_pipeline_status()
+
+def extract_phone_number(text: str) -> Optional[str]:
+    """Extracts a 10-digit phone number from either digits or spelled out words."""
+    if not text:
+        return None
+    import re
+    # 1. Standard digit formats (e.g., 415-555-0123, 9123456780, (415) 555-0123, 4 1 5 5 5 5 0 1 2 3)
+    digit_sequences = re.findall(r'\b(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})\b', text)
+    if digit_sequences:
+        return "".join(digit_sequences[0])
+
+    raw_digits = re.findall(r'\b\d[\d\s\-\.]{7,}\d\b', text)
+    if raw_digits:
+        cleaned = re.sub(r'\D', '', raw_digits[0])
+        if len(cleaned) >= 10:
+            return cleaned[-10:]
+
+    # 2. Spelled out words (e.g. 'nine one two, three four five, six seven eight zero')
+    word_map = {
+        "zero": "0", "oh": "0", "o": "0",
+        "one": "1", "two": "2", "three": "3", "four": "4",
+        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
+    }
+    tokens = re.findall(r'[a-zA-Z]+|\d+', text.lower())
+    digit_stream = []
+    for t in tokens:
+        if t in word_map:
+            digit_stream.append(word_map[t])
+        elif t.isdigit():
+            digit_stream.extend(list(t))
+        else:
+            if len(digit_stream) >= 10:
+                break
+            digit_stream = []
+    if len(digit_stream) >= 10:
+        return "".join(digit_stream[:10])
+
+    return None
+
+def extract_doctor(text: str) -> Optional[str]:
+    """Identifies doctor from text across first name, last name, or specialty."""
+    if not text:
+        return None
+    lower = text.lower()
+    if any(k in lower for k in ["vance", "marcus", "derma", "skin"]):
+        return "Dr. Marcus Vance"
+    elif any(k in lower for k in ["rostova", "elena", "neuro", "brain"]):
+        return "Dr. Elena Rostova"
+    elif any(k in lower for k in ["chen", "james", "general", "primary"]):
+        return "Dr. James Chen"
+    elif any(k in lower for k in ["lin", "sarah", "cardio", "heart"]):
+        return "Dr. Sarah Lin"
+    return None
+
+def extract_date(text: str) -> Optional[str]:
+    """Extracts target date (today or tomorrow)."""
+    if not text:
+        return None
+    lower = text.lower()
+    if "tomorrow" in lower:
+        return "tomorrow"
+    elif "today" in lower:
+        return "today"
+    return None
+
+def extract_time_slot(text: str) -> Optional[str]:
+    """Extracts and normalizes appointment time slot to daytime clinic hours."""
+    if not text:
+        return None
+    lower = text.lower()
+    if "9:30" in lower or "09:30" in lower or "nine thirty" in lower:
+        return "09:30 AM"
+    elif "11:00" in lower or "11" in lower or "eleven" in lower:
+        # Daytime clinic normalization: 11 PM / 11:00 PM -> 11:00 AM
+        return "11:00 AM"
+    elif "2:30" in lower or "02:30" in lower or "two thirty" in lower:
+        return "02:30 PM"
+    elif "4:00" in lower or "04:00" in lower or "4" in lower or "four" in lower:
+        return "04:00 PM"
+    return None
 
 class ClinicalVoiceSession:
     """Manages conversational state, intent resolution, tool execution, and transcript distribution."""
@@ -101,12 +177,68 @@ class ClinicalVoiceSession:
         self.history = []
         self.pending_confirmation = None # For phone number verification
         self.patient_phone = None
+        self.chat = None
+        self.gemini_client = None
+        self.active_model = None
+        # Track pending booking details across turns
+        self.pending_booking = {
+            "doctor_name": None,
+            "date": None,
+            "time_slot": None,
+            "caller_phone": None,
+            "read_back_completed": False
+        }
+
+    def _update_state_from_text(self, text: str, speaker: str = "CALLER"):
+        """Scans caller or assistant speech to track physician, slot, date, and verified phone."""
+        if not text:
+            return
+
+        doc = extract_doctor(text)
+        if doc:
+            self.pending_booking["doctor_name"] = doc
+
+        dt = extract_date(text)
+        if dt:
+            self.pending_booking["date"] = dt
+
+        slot = extract_time_slot(text)
+        if slot:
+            self.pending_booking["time_slot"] = slot
+
+        phone = extract_phone_number(text)
+        if phone:
+            self.pending_booking["caller_phone"] = phone
+            self.patient_phone = phone
+
+        lower = text.lower()
+        # When assistant reads back phone number or asks for confirmation
+        if speaker == "AGENT":
+            if any(w in lower for w in ["confirm your phone number", "confirm your number", "verify your phone", "verify your number", "is that correct", "confirm that"]):
+                self.pending_booking["read_back_completed"] = True
+                if self.pending_booking.get("caller_phone"):
+                    self.pending_confirmation = {
+                        "action": "book",
+                        "phone": self.pending_booking["caller_phone"],
+                        "doctor_name": self.pending_booking.get("doctor_name", "Dr. Marcus Vance"),
+                        "date": self.pending_booking.get("date", "today"),
+                        "time_slot": self.pending_booking.get("time_slot", "11:00 AM")
+                    }
+        elif speaker == "CALLER":
+            if any(w in lower for w in ["cancel", "drop", "delete my appointment"]):
+                self.pending_confirmation = {
+                    "action": "cancel",
+                    "phone": self.pending_booking.get("caller_phone") or self.patient_phone
+                }
 
     async def handle_user_utterance(self, text: str) -> str:
         """Processes caller speech, runs Gemini LLM with function calling, and returns response."""
         text = text.strip()
         if not text:
             return ""
+
+        # Update state from caller utterance
+        self._update_state_from_text(text, speaker="CALLER")
 
         # Broadcast caller transcript
         await events_bus.broadcast({
@@ -118,14 +250,16 @@ class ClinicalVoiceSession:
 
         keys = get_api_keys()
 
-        # If Gemini API key is configured, use Google Gemini with live function calling
+        # If Gemini API key is configured, invoke Google Gemini live
         if keys["gemini_key"]:
             try:
-                print(f"\n[AI PIPELINE] Caller Utterance: \"{text}\"")
-                print(f"[AI PIPELINE] Dispatching to Google Gemini with function calling...")
+                print("\n" + "="*65)
+                print(f"[LIVE PIPELINE] Processing Caller Utterance: \"{text}\"")
+                print("="*65)
                 response_text = await self._run_gemini(text, keys["gemini_key"], keys["preferred_model"])
                 if response_text:
-                    print(f"[AI PIPELINE] Gemini Response: \"{response_text[:120]}...\"\n")
+                    self._update_state_from_text(response_text, speaker="AGENT")
+                    print(f"\n[LIVE PIPELINE AGENT RESPONSE]\n\"{response_text}\"\n" + "="*65 + "\n")
                     await events_bus.broadcast({
                         "type": "TRANSCRIPT_UPDATE",
                         "speaker": "AGENT",
@@ -134,11 +268,16 @@ class ClinicalVoiceSession:
                     })
                     return response_text
             except Exception as e:
-                print(f"\n[AI PIPELINE WARNING] Gemini Error: {e}")
-                print(f"[AI PIPELINE NOTICE] Falling back to intelligent local dispatch coordinator for this turn.\n")
+                import traceback
+                print("\n" + "!"*65)
+                print(f"[GEMINI API ERROR] {type(e).__name__}: {e}")
+                print(f"[GEMINI API TRACEBACK]\n{traceback.format_exc()}")
+                print("[NOTICE] Engaging local dispatch fallback for this turn.")
+                print("!"*65 + "\n")
 
         # Fallback / simulated smart dispatch coordinator
         response_text = await self._run_dispatch_logic(text)
+        self._update_state_from_text(response_text, speaker="AGENT")
         await events_bus.broadcast({
             "type": "TRANSCRIPT_UPDATE",
             "speaker": "AGENT",
@@ -151,9 +290,16 @@ class ClinicalVoiceSession:
         from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=api_key)
+        # Prioritize gemini-3.5-flash which is active and supports function calling on Google AI Studio
+        candidates = []
+        if preferred_model and preferred_model != "gemini-2.5-flash":
+            candidates.append(preferred_model)
+        candidates.extend(["gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest"])
+        models_to_try = list(dict.fromkeys(candidates))
 
-        # Gemini Tools configuration
+        if self.gemini_client is None:
+            self.gemini_client = genai.Client(api_key=api_key)
+
         gemini_tools = []
         for td in TOOL_DEFINITIONS:
             gemini_tools.append(types.Tool(function_declarations=[
@@ -170,165 +316,134 @@ class ClinicalVoiceSession:
             tools=gemini_tools
         )
 
-        # Model resolution: try preferred model (e.g. gemini-2.5-flash), fall back to gemini-3.8-flash if deprecated
-        models_to_try = [preferred_model, "gemini-3.8-flash", "gemini-flash-latest"]
-        last_error = None
         response = None
-        active_model = None
-
         for model_name in models_to_try:
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=user_text,
-                    config=config
-                )
-                active_model = model_name
+                if self.chat is None or self.active_model != model_name:
+                    print(f"[GEMINI API ATTEMPT] Initializing Chat session with model '{model_name}'...")
+                    self.chat = self.gemini_client.chats.create(model=model_name, config=config)
+                    self.active_model = model_name
+                    print(f"[GEMINI API SUCCESS] Chat session ready with model '{model_name}'!")
+
+                response = self.chat.send_message(user_text)
                 break
             except Exception as e:
                 err_str = str(e)
-                last_error = e
-                if "404" in err_str or "no longer available" in err_str:
-                    print(f"[AI PIPELINE] Model '{model_name}' deprecated/not found for this key. Trying next candidate...")
+                print(f"[GEMINI API NOTICE] Model '{model_name}' failed: {e}")
+                self.chat = None
+                if "404" in err_str or "no longer available" in err_str or "not found" in err_str or "503" in err_str:
                     continue
                 else:
                     raise e
 
         if not response:
-            raise last_error or Exception("Could not reach Gemini model")
+            raise Exception("No Gemini model responded successfully")
 
-        # Handle Function Calls
-        if response.function_calls:
-            for call in response.function_calls:
+        # Print exact model response details
+        print(f"\n[GEMINI API RAW OUTPUT]")
+        print(f"  Model:          {self.active_model}")
+        print(f"  Text:           {repr(response.text)}")
+        print(f"  Function Calls: {response.function_calls}")
+
+        # Handle Function Calls in a loop for multi-step tool interactions
+        current_resp = response
+        depth = 0
+        while current_resp.function_calls and depth < 3:
+            depth += 1
+            for call in current_resp.function_calls:
                 func_name = call.name
                 func_args = dict(call.args) if call.args else {}
-                print(f"\n>>> [GEMINI TOOL CALL TRIGGERED] Function: {func_name}")
-                print(f"    Arguments: {json.dumps(func_args)}")
-                
+                print(f"\n>>> [GEMINI TOOL EXECUTION] Function: {func_name}")
+                print(f"    Arguments: {json.dumps(func_args, indent=2)}")
+
                 tool_result = await execute_tool_call(func_name, func_args)
-                print(f"    Result: {json.dumps(tool_result)}")
+                print(f"    Tool Result: {json.dumps(tool_result, indent=2)}")
 
-                # Send tool execution result back to Gemini for natural spoken completion
-                follow_up = client.models.generate_content(
-                    model=active_model,
-                    contents=[
-                        user_text,
-                        types.Part.from_function_response(
-                            name=func_name,
-                            response={"result": tool_result}
-                        )
-                    ],
-                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+                # Send tool execution result back to Gemini Chat
+                print(f"[GEMINI API FOLLOW-UP] Feeding tool result back to '{self.active_model}' chat...")
+                from google.genai import types
+                current_resp = self.chat.send_message(
+                    types.Part.from_function_response(
+                        name=func_name,
+                        response={"result": tool_result}
+                    )
                 )
-                return follow_up.text or f"I have completed that for you: {tool_result.get('message', 'Done')}."
+                print(f"    Follow-up Text: {repr(current_resp.text)}")
 
-        return response.text or "Thank you for calling NexoVAI Clinical Dispatch. How else may I assist you?"
+        return current_resp.text or "Thank you for calling NexoVAI Clinical Dispatch. How may I assist you with your appointment today?"
 
     async def _run_dispatch_logic(self, text: str) -> str:
         """Robust clinical dispatch state machine adhering to the Mandatory Read-Back Rule."""
         lower = text.lower()
-        import re
 
-        # Check if caller is confirming a previously read-back phone number
-        if self.pending_confirmation:
-            if any(w in lower for w in ["yes", "correct", "that's right", "right", "yep", "sure", "exactly"]):
-                action = self.pending_confirmation["action"]
-                phone = self.pending_confirmation["phone"]
-                
-                if action == "book":
-                    res = await execute_tool_call("book_appointment", {
-                        "patient_phone": phone,
-                        "doctor_name": self.pending_confirmation.get("doctor_name", "Dr. Sarah Lin"),
-                        "date": self.pending_confirmation.get("date", "today"),
-                        "time_slot": self.pending_confirmation.get("time_slot", "02:30 PM")
-                    })
-                    self.pending_confirmation = None
-                    if res["status"] == "success":
-                        return f"Perfect! Your appointment with {res['doctor_name']} on {res['date_label']} at {res['time_slot']} is officially confirmed under confirmation {res['appointment_id']}. We sent a confirmation SMS to {phone}. Is there anything else I can help you with?"
-                    else:
-                        return f"I apologize, but {res['message']} Would you like to check another time slot?"
+        # Update extraction
+        self._update_state_from_text(text, speaker="CALLER")
 
-                elif action == "cancel":
-                    res = await execute_tool_call("cancel_appointment", {"patient_phone": phone})
-                    self.pending_confirmation = None
-                    if res["status"] == "success":
-                        return f"Thank you for confirming. Your appointment with {res['doctor_name']} on {res['date']} at {res['time_slot']} has been successfully canceled and the slot released. Can I help you with anything else?"
-                    else:
-                        return f"I checked our records, but {res['message']} Would you like me to look up another phone number?"
+        # Detect affirmative confirmation from caller
+        is_affirmative = any(w in lower for w in [
+            "yes", "correct", "that's right", "right", "yep", "sure", "exactly",
+            "confirm", "confirmed", "book it", "go ahead", "please do", "sounds good",
+            "lock it in", "proceed", "do it", "please book", "book that", "yes please",
+            "yeah", "yup", "ok", "okay"
+        ])
 
-            elif any(w in lower for w in ["no", "incorrect", "wrong", "nope"]):
+        # Check if caller is confirming a pending booking or cancellation
+        effective_phone = self.pending_booking.get("caller_phone") or (self.pending_confirmation and self.pending_confirmation.get("phone")) or self.patient_phone
+        if is_affirmative and effective_phone:
+            # Handle cancellation confirmation
+            if self.pending_confirmation and self.pending_confirmation.get("action") == "cancel":
+                res = await execute_tool_call("cancel_appointment", {"patient_phone": effective_phone})
                 self.pending_confirmation = None
-                return "My apologies. Please speak your phone number again slowly so I can update it."
+                self.pending_booking = {"doctor_name": None, "date": None, "time_slot": None, "caller_phone": None, "read_back_completed": False}
+                if res.get("status") == "success":
+                    return f"Thank you for confirming. Your appointment with {res.get('doctor_name', 'your doctor')} on {res.get('date', 'your scheduled date')} at {res.get('time_slot', 'scheduled time')} has been successfully canceled and the slot released. Can I help you with anything else?"
+                else:
+                    return f"I checked our records, but {res.get('message', 'no active booking was found for that number')}. Would you like me to look up another phone number?"
 
-        # Detect phone numbers spoken in digits
-        digits_match = re.findall(r'\b\d[\d\s\-]{5,}\d\b', text)
-        found_phone = digits_match[0].replace(" ", "").replace("-", "") if digits_match else None
+            # Handle booking confirmation (prioritize tracked details, never reset to Dr. Sarah Lin)
+            doctor = self.pending_booking.get("doctor_name") or (self.pending_confirmation and self.pending_confirmation.get("doctor_name")) or "Dr. Marcus Vance"
+            date_val = self.pending_booking.get("date") or (self.pending_confirmation and self.pending_confirmation.get("date")) or "today"
+            slot_val = self.pending_booking.get("time_slot") or (self.pending_confirmation and self.pending_confirmation.get("time_slot")) or "11:00 AM"
 
-        # Check for cancellation intent
-        if any(w in lower for w in ["cancel", "reschedule", "drop"]):
-            if found_phone:
-                self.patient_phone = found_phone
-                # MANDATORY READ-BACK RULE
-                spoken_digits = " ".join(list(found_phone))
-                self.pending_confirmation = {"action": "cancel", "phone": found_phone}
-                return f"I can certainly help you cancel that. Before I proceed, let me verify your phone number: {spoken_digits}. Is that correct?"
+            print(f"[DISPATCH CONFIRMATION] Executing booking: Doctor={doctor}, Date={date_val}, Slot={slot_val}, Phone={effective_phone}")
+            res = await execute_tool_call("book_appointment", {
+                "patient_phone": effective_phone,
+                "doctor_name": doctor,
+                "date": date_val,
+                "time_slot": slot_val
+            })
+            self.pending_confirmation = None
+            self.pending_booking = {"doctor_name": None, "date": None, "time_slot": None, "caller_phone": None, "read_back_completed": False}
+
+            if res.get("status") == "success":
+                date_display = res.get("date_label") or date_val.title()
+                return f"Perfect! Your appointment with {res.get('doctor_name', doctor)} on {date_display} at {res.get('time_slot', slot_val)} is officially confirmed under confirmation {res.get('appointment_id', 'APT-CONFIRMED')}. We sent a confirmation SMS to {effective_phone}. Is there anything else I can help you with?"
             else:
-                return "I can help you cancel your appointment. What is the phone number associated with your booking?"
+                return f"I apologize, but {res.get('message', 'that slot is no longer available')}. Would you like to check another time slot?"
 
-        # Check for booking intent
-        if any(w in lower for w in ["book", "schedule", "reserve", "make an appointment"]):
-            doc_name = None
-            if "lin" in lower or "cardio" in lower:
-                doc_name = "Dr. Sarah Lin"
-            elif "vance" in lower or "derma" in lower:
-                doc_name = "Dr. Marcus Vance"
-            elif "rostova" in lower or "neuro" in lower:
-                doc_name = "Dr. Elena Rostova"
-            elif "chen" in lower or "general" in lower or "primary" in lower:
-                doc_name = "Dr. James Chen"
-            else:
-                doc_name = "Dr. Sarah Lin"
+        # Caller rejection of read-back
+        is_rejection = any(w in lower for w in ["no", "incorrect", "wrong", "nope", "not right"])
+        if is_rejection:
+            self.pending_booking["caller_phone"] = None
+            self.pending_booking["read_back_completed"] = False
+            self.pending_confirmation = None
+            return "My apologies. Please speak your phone number again slowly so I can update it."
 
-            date_choice = "tomorrow" if "tomorrow" in lower else "today"
-            
-            time_slot = "02:30 PM"
-            if "9:30" in lower or "9" in lower:
-                time_slot = "09:30 AM"
-            elif "11" in lower:
-                time_slot = "11:00 AM"
-            elif "4" in lower or "04" in lower:
-                time_slot = "04:00 PM"
+        # Check for availability queries first (e.g. 'What does Marcus have open today?', 'Is Vance available?')
+        is_avail_query = any(w in lower for w in [
+            "available", "availability", "open", "opening", "openings", "free", "slots", "slot", "when", "what does", "what do you have", "schedule for"
+        ]) and not any(w in lower for w in ["book", "schedule an appointment", "reserve", "make an appointment"])
 
-            if found_phone:
-                self.patient_phone = found_phone
-                spoken_digits = " ".join(list(found_phone))
-                self.pending_confirmation = {
-                    "action": "book",
-                    "phone": found_phone,
-                    "doctor_name": doc_name,
-                    "date": date_choice,
-                    "time_slot": time_slot
-                }
-                return f"Understood. For your booking with {doc_name} {date_choice} at {time_slot}, let me confirm your phone number: {spoken_digits}. Is that correct?"
-            else:
-                self.pending_target = {"doctor_name": doc_name, "date": date_choice, "time_slot": time_slot}
-                return f"I would be glad to book you with {doc_name} {date_choice} at {time_slot}. What is the best phone number to reach you at?"
-
-        # Check for availability queries
-        if any(w in lower for w in ["available", "availability", "open", "free", "slots", "when", "see", "doctor", "cardiology", "dermatology", "neurology", "general"]):
-            doc_query = None
+        if is_avail_query:
+            doc_query = extract_doctor(text) or self.pending_booking.get("doctor_name")
             spec_query = None
-            if "lin" in lower: doc_query = "Dr. Sarah Lin"
-            elif "vance" in lower: doc_query = "Dr. Marcus Vance"
-            elif "rostova" in lower: doc_query = "Dr. Elena Rostova"
-            elif "chen" in lower: doc_query = "Dr. James Chen"
-
             if "cardio" in lower: spec_query = "Cardiology"
             elif "derma" in lower: spec_query = "Dermatology"
             elif "neuro" in lower: spec_query = "Neurology"
             elif "general" in lower: spec_query = "General Medicine"
 
-            date_query = "tomorrow" if "tomorrow" in lower else ("today" if "today" in lower else None)
+            date_query = extract_date(text) or self.pending_booking.get("date")
+
             res = await execute_tool_call("check_doctor_availability", {
                 "doctor_name": doc_query,
                 "specialty": spec_query,
@@ -336,10 +451,62 @@ class ClinicalVoiceSession:
             })
             slots = res.get("available_slots", [])
             if slots:
-                first_few = [f"{s['doctor_name']} on {s['date_label']} at {s['time_slot']}" for s in slots[:3]]
-                return f"We currently have {len(slots)} open slots. For example: {', '.join(first_few)}. Which physician and time would work best for you?"
+                if doc_query:
+                    slot_times = [s["time_slot"] for s in slots[:4]]
+                    date_label = slots[0].get("date_label", date_query or "Today")
+                    return f"{doc_query} currently has open slots on {date_label} at {', '.join(slot_times)}. Would one of those work for you?"
+                else:
+                    first_few = [f"{s['doctor_name']} on {s['date_label']} at {s['time_slot']}" for s in slots[:3]]
+                    return f"We currently have {len(slots)} open slots. For example: {', '.join(first_few)}. Which physician and time would work best for you?"
             else:
+                if doc_query:
+                    return f"I checked, but {doc_query} does not have any open slots on {date_query or 'today or tomorrow'}. Would you like to check another day or doctor?"
                 return "We do not have any open slots matching that criteria today or tomorrow. Would you like to check another specialty?"
 
-        # Greeting fallback
-        return "Hello! Thank you for calling NexoVAI Clinical Dispatch. I can check physician availability, book a new appointment, or cancel an existing one for you today or tomorrow. How can I assist you today?"
+        # Check if caller has explicit booking intent
+        is_booking_intent = any(w in lower for w in [
+            "book", "schedule", "reserve", "make an appointment", "appointment for", "appointment with"
+        ]) or (
+            any(d in lower for d in ["lin", "vance", "marcus", "rostova", "chen"]) and 
+            any(t in lower for t in ["9", "11", "2:30", "4", "am", "pm", "today", "tomorrow"])
+        )
+
+        if is_booking_intent:
+            doc_name = extract_doctor(text) or self.pending_booking.get("doctor_name") or "Dr. Marcus Vance"
+            date_choice = extract_date(text) or self.pending_booking.get("date") or "today"
+            time_slot = extract_time_slot(text) or self.pending_booking.get("time_slot") or "11:00 AM"
+            phone = extract_phone_number(text) or self.pending_booking.get("caller_phone") or self.patient_phone
+
+            # Update pending booking state
+            self.pending_booking["doctor_name"] = doc_name
+            self.pending_booking["date"] = date_choice
+            self.pending_booking["time_slot"] = time_slot
+
+            if phone:
+                self.pending_booking["caller_phone"] = phone
+                self.patient_phone = phone
+                spoken_digits = " ".join(list(phone))
+                self.pending_confirmation = {
+                    "action": "book",
+                    "phone": phone,
+                    "doctor_name": doc_name,
+                    "date": date_choice,
+                    "time_slot": time_slot
+                }
+                return f"Understood. For your booking with {doc_name} {date_choice} at {time_slot}, let me confirm your phone number: {spoken_digits}. Is that correct?"
+            else:
+                return f"I would be glad to book you with {doc_name} {date_choice} at {time_slot}. What is the best phone number to reach you at?"
+
+        # Check for cancellation intent
+        if any(w in lower for w in ["cancel", "drop", "delete my appointment"]):
+            phone = extract_phone_number(text) or self.pending_booking.get("caller_phone") or self.patient_phone
+            if phone:
+                self.patient_phone = phone
+                spoken_digits = " ".join(list(phone))
+                self.pending_confirmation = {"action": "cancel", "phone": phone}
+                return f"I can certainly help you cancel that. Before I proceed, let me verify your phone number: {spoken_digits}. Is that correct?"
+            else:
+                return "I can help you cancel your appointment. What is the phone number associated with your booking?"
+
+        # Neutral greeting fallback without the word "cancel"
+        return "Thank you for calling NexoVAI Clinical Dispatch. How may I assist you with your appointment today?"

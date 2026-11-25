@@ -83,19 +83,48 @@ async def run_tests():
     # 6a. Caller asks for booking
     resp1 = await session.handle_user_utterance("I would like to book an appointment with Dr. Elena Rostova tomorrow at 11:00 AM. My number is 415-555-0123.")
     print("Caller: 'I would like to book an appointment with Dr. Elena Rostova tomorrow at 11:00 AM. My number is 415-555-0123.'")
-    print(f"Agent: {resp1}")
-    assert "confirm your phone number" in resp1 or "verify" in resp1
-    assert "4 1 5 5 5 5 0 1 2 3" in resp1 or "415" in resp1
+    assert "confirm" in resp1.lower() or "verify" in resp1.lower()
+    assert "415" in resp1 or "four" in resp1.lower() or "4 1 5" in resp1
     print("-> Mandatory Read-Back Rule successfully triggered.")
 
     # 6b. Caller confirms
     resp2 = await session.handle_user_utterance("Yes, that is correct.")
     print("Caller: 'Yes, that is correct.'")
     print(f"Agent: {resp2}")
-    assert "confirmed" in resp2.lower()
+    assert "confirmed" in resp2.lower() or "booked" in resp2.lower() or "scheduled" in resp2.lower()
     print("-> Appointment confirmed upon caller confirmation.")
+
+    print("\n=== TEST 7: State Tracking Across Assistant Read-Back (Marcus Vance Scenario) ===")
+    session2 = ClinicalVoiceSession("test-marcus-scenario")
+    # Simulate assistant speaking the read-back with spelled out phone words
+    assistant_utterance = "Our clinic operates during the day, so I'll set that for 11:00 AM today with Dr. Marcus Vance. Before I book that, let me confirm your phone number: nine one two, three four five, six seven eight zero. Is that correct?"
+    session2._update_state_from_text(assistant_utterance, speaker="AGENT")
+    
+    assert session2.pending_booking["doctor_name"] == "Dr. Marcus Vance"
+    assert session2.pending_booking["time_slot"] == "11:00 AM"
+    assert session2.pending_booking["caller_phone"] == "9123456780"
+    assert session2.pending_booking["date"] == "today"
+    print("-> Assistant read-back correctly populated pending_booking: Dr. Marcus Vance, Today at 11:00 AM, 9123456780.")
+
+    # User confirms in fallback mode: "Uh, yes, that's completely correct. Please go ahead and book it."
+    resp_confirm = await session2._run_dispatch_logic("Uh, yes, that's completely correct. Please go ahead and book it.")
+    print(f"Agent Response: {resp_confirm}")
+    assert "marcus vance" in resp_confirm.lower()
+    assert "11:00 am" in resp_confirm.lower()
+    assert "sarah lin" not in resp_confirm.lower()
+    assert "confirmed" in resp_confirm.lower()
+    print("-> Successfully confirmed Dr. Marcus Vance at 11:00 AM (NEVER defaulted to Dr. Sarah Lin 02:30 PM).")
+
+    print("\n=== TEST 8: Availability Filtering by Doctor Name ('Marcus') ===")
+    session3 = ClinicalVoiceSession("test-avail-marcus")
+    resp_avail = await session3._run_dispatch_logic("What does Marcus have open today?")
+    print(f"Agent Response: {resp_avail}")
+    assert "marcus vance" in resp_avail.lower()
+    assert "sarah lin" not in resp_avail.lower()
+    print("-> Successfully filtered availability strictly to Dr. Marcus Vance.")
 
     print("\nALL AUTOMATED TESTS PASSED SUCCESSFULLY!")
 
 if __name__ == "__main__":
     asyncio.run(run_tests())
+

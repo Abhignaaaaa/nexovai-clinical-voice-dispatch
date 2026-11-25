@@ -6,8 +6,10 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
   const [callDuration, setCallDuration] = useState(0); // in seconds
   const [audioData, setAudioData] = useState(new Uint8Array(64));
 
+  const callStateRef = useRef('IDLE');
   const isMutedRef = useRef(false);
   const isAgentSpeakingRef = useRef(false);
+  const lastAgentUtteranceRef = useRef('');
   const wsRef = useRef(null);
   const audioCtxRef = useRef(null);
   const ringOsc1Ref = useRef(null);
@@ -20,6 +22,10 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
   const timerIntervalRef = useRef(null);
   const recognitionRef = useRef(null);
   const synthRef = useRef(window.speechSynthesis || null);
+
+  useEffect(() => {
+    callStateRef.current = callState;
+  }, [callState]);
 
   // Initialize Web Audio Context
   const getAudioContext = useCallback(() => {
@@ -123,54 +129,19 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
     animFrameRef.current = requestAnimationFrame(updateWaveform);
   }, []);
 
-  // Speak agent message aloud with mic gating & echo suppression
-  const speakAgentMessage = useCallback((text) => {
-    if (!synthRef.current || !text) return;
-    try {
-      synthRef.current.cancel();
-
-      // Mute outgoing mic tracks during agent speech
-      isAgentSpeakingRef.current = true;
-      if (micStreamRef.current) {
-        micStreamRef.current.getAudioTracks().forEach(track => {
-          track.enabled = false;
-        });
-      }
-
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.05;
-      utterance.pitch = 1.0;
-      
-      const voices = synthRef.current.getVoices();
-      const preferred = voices.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha')));
-      if (preferred) utterance.voice = preferred;
-
-      // Re-enable mic after agent speech ends with 350ms acoustic decay buffer
-      const restoreMic = () => {
-        setTimeout(() => {
-          isAgentSpeakingRef.current = false;
-          if (micStreamRef.current && !isMutedRef.current) {
-            micStreamRef.current.getAudioTracks().forEach(track => {
-              track.enabled = true;
-            });
-          }
-        }, 350);
-      };
-
-      utterance.onend = restoreMic;
-      utterance.onerror = restoreMic;
-
-      synthRef.current.speak(utterance);
-    } catch (e) {
-      console.warn('Speech synthesis error:', e);
-      isAgentSpeakingRef.current = false;
+  // Stop browser speech recognition
+  const stopSpeechRecognition = useCallback(() => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch (e) {}
+      recognitionRef.current = null;
     }
   }, []);
 
   // Send user utterance to agent
   const sendUserSpeech = useCallback((text) => {
     if (!text || !text.trim()) return;
-    // Prevent self-loop if agent is currently speaking
     if (isAgentSpeakingRef.current) {
       console.log('Suppressed self-echo input while agent was speaking');
       return;
@@ -204,25 +175,38 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
         })
         .catch(err => console.error('Error sending fallback utterance:', err));
     }
-  }, [onCallerSpeech, onAgentMessage, speakAgentMessage]);
+  }, [onCallerSpeech, onAgentMessage]);
 
-  // Browser speech recognition (SpeechRecognition API) with echo gating
+  // Browser speech recognition (SpeechRecognition API) with echo gating & substring suppression
   const startSpeechRecognition = useCallback(() => {
+    if (callStateRef.current !== 'CONNECTED' || isAgentSpeakingRef.current || isMutedRef.current) {
+      return;
+    }
+
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
       console.log('Web SpeechRecognition not supported in this browser, text input available.');
       return;
     }
 
+    // Stop existing instance before starting fresh
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch (e) {}
+      recognitionRef.current = null;
+    }
+
     try {
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
-      recognition.interimResults = true;
+      recognition.interimResults = false;
       recognition.lang = 'en-US';
 
       recognition.onresult = (event) => {
-        // Echo gate: if agent TTS is playing, discard mic audio
+        // Echo gate: if agent TTS is actively playing, discard mic audio completely
         if (isAgentSpeakingRef.current) {
+          console.log('Acoustic gate active: dropped audio during agent speech');
           return;
         }
 
@@ -232,14 +216,55 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
             finalTranscript += event.results[i][0].transcript;
           }
         }
-        if (finalTranscript.trim()) {
-          console.log('Spoken transcript:', finalTranscript);
-          sendUserSpeech(finalTranscript);
+
+        finalTranscript = finalTranscript.trim();
+        if (!finalTranscript) return;
+
+        // Substring & greeting echo suppression
+        const lowerUser = finalTranscript.toLowerCase();
+        const lastAgent = (lastAgentUtteranceRef.current || '').toLowerCase();
+
+        const greetingKeywords = [
+          "thank you for calling",
+          "nexovai clinical dispatch",
+          "clinical dispatch",
+          "how may i assist you",
+          "assist you with your appointment",
+          "appointment today",
+          "how can i help you"
+        ];
+
+        const isGreetingEcho = greetingKeywords.some(phrase => 
+          lowerUser.includes(phrase) && lowerUser.length < phrase.length + 25
+        );
+
+        const isAgentEcho = lastAgent && (
+          lastAgent.includes(lowerUser) || 
+          (lowerUser.length > 8 && lastAgent.includes(lowerUser.slice(0, 16)))
+        );
+
+        if (isGreetingEcho || isAgentEcho) {
+          console.log('Suppressed browser SpeechRecognition echo of agent audio:', finalTranscript);
+          return;
         }
+
+        console.log('Spoken caller transcript verified:', finalTranscript);
+        sendUserSpeech(finalTranscript);
       };
 
       recognition.onerror = (e) => {
-        console.warn('Speech recognition notice:', e.error);
+        if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          console.warn('Speech recognition notice:', e.error);
+        }
+      };
+
+      recognition.onend = () => {
+        // Auto-restart recognition only if call is still active and agent is NOT speaking
+        if (callStateRef.current === 'CONNECTED' && !isAgentSpeakingRef.current && !isMutedRef.current) {
+          try {
+            recognition.start();
+          } catch (e) {}
+        }
       };
 
       recognition.start();
@@ -249,20 +274,64 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
     }
   }, [sendUserSpeech]);
 
-  const stopSpeechRecognition = useCallback(() => {
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch (e) {}
-      recognitionRef.current = null;
+  // Speak agent message aloud with HARD recognition stop & 500ms delay restart
+  const speakAgentMessage = useCallback((text) => {
+    if (!synthRef.current || !text) return;
+    try {
+      synthRef.current.cancel();
+
+      // 1. Record last agent message for substring echo filtering
+      lastAgentUtteranceRef.current = text.toLowerCase();
+      isAgentSpeakingRef.current = true;
+
+      // 2. Explicitly stop/abort browser SpeechRecognition immediately
+      stopSpeechRecognition();
+
+      // 3. Mute outgoing mic tracks during agent speech
+      if (micStreamRef.current) {
+        micStreamRef.current.getAudioTracks().forEach(track => {
+          track.enabled = false;
+        });
+      }
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.05;
+      utterance.pitch = 1.0;
+      
+      const voices = synthRef.current.getVoices();
+      const preferred = voices.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha')));
+      if (preferred) utterance.voice = preferred;
+
+      // 4. Re-enable mic & SpeechRecognition 500ms AFTER speech ends
+      const onSpeechEnd = () => {
+        setTimeout(() => {
+          isAgentSpeakingRef.current = false;
+          if (micStreamRef.current && !isMutedRef.current) {
+            micStreamRef.current.getAudioTracks().forEach(track => {
+              track.enabled = true;
+            });
+          }
+          // Restart SpeechRecognition ONLY if call is still active
+          if (callStateRef.current === 'CONNECTED' && !isMutedRef.current) {
+            startSpeechRecognition();
+          }
+        }, 500);
+      };
+
+      utterance.onend = onSpeechEnd;
+      utterance.onerror = onSpeechEnd;
+
+      synthRef.current.speak(utterance);
+    } catch (e) {
+      console.warn('Speech synthesis error:', e);
+      isAgentSpeakingRef.current = false;
     }
-    if (synthRef.current) {
-      try { synthRef.current.cancel(); } catch (e) {}
-    }
-    isAgentSpeakingRef.current = false;
-  }, []);
+  }, [stopSpeechRecognition, startSpeechRecognition]);
 
   // Start Call workflow
   const startCall = useCallback(async () => {
     setCallState('DIALING');
+    callStateRef.current = 'DIALING';
     setCallDuration(0);
     startRingbackTone();
 
@@ -294,6 +363,7 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
     setTimeout(() => {
       stopRingbackTone();
       setCallState('CONNECTED');
+      callStateRef.current = 'CONNECTED';
 
       // Start call timer
       timerIntervalRef.current = setInterval(() => {
@@ -339,6 +409,11 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
     stopRingbackTone();
     playHangupTone();
     stopSpeechRecognition();
+    if (synthRef.current) {
+      try { synthRef.current.cancel(); } catch (e) {}
+    }
+    isAgentSpeakingRef.current = false;
+    lastAgentUtteranceRef.current = '';
 
     if (timerIntervalRef.current) {
       clearInterval(timerIntervalRef.current);
@@ -364,10 +439,12 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
     }
 
     setCallState('ENDED');
+    callStateRef.current = 'ENDED';
     if (onCallEnded) onCallEnded();
 
     setTimeout(() => {
       setCallState('IDLE');
+      callStateRef.current = 'IDLE';
       setCallDuration(0);
       setAudioData(new Uint8Array(64));
     }, 2500);
@@ -378,6 +455,11 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
     setIsMuted((prev) => {
       const next = !prev;
       isMutedRef.current = next;
+      if (next) {
+        stopSpeechRecognition();
+      } else if (callStateRef.current === 'CONNECTED' && !isAgentSpeakingRef.current) {
+        startSpeechRecognition();
+      }
       if (micStreamRef.current) {
         micStreamRef.current.getAudioTracks().forEach((track) => {
           track.enabled = !next;
@@ -385,12 +467,15 @@ export function useVoiceCall({ onCallerSpeech, onAgentMessage, onCallEnded }) {
       }
       return next;
     });
-  }, []);
+  }, [stopSpeechRecognition, startSpeechRecognition]);
 
   useEffect(() => {
     return () => {
       stopRingbackTone();
       stopSpeechRecognition();
+      if (synthRef.current) {
+        try { synthRef.current.cancel(); } catch (e) {}
+      }
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       if (micStreamRef.current) micStreamRef.current.getTracks().forEach(t => t.stop());

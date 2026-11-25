@@ -147,8 +147,8 @@ async def websocket_voice_endpoint(websocket: WebSocket):
             "session_id": session_id
         })
 
-        # Send initial greeting
-        greeting = "Thank you for calling NexoVAI Clinical Dispatch. I can check doctor availability, book, or cancel an appointment for you today or tomorrow. How may I help you?"
+        # Send initial greeting (no 'cancel' word to avoid false-trigger echo)
+        greeting = "Thank you for calling NexoVAI Clinical Dispatch. How may I assist you with your appointment today?"
         await websocket.send_text(json.dumps({
             "type": "AGENT_MESSAGE",
             "text": greeting,
